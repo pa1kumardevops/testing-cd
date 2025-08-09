@@ -1,3 +1,0 @@
-image:
-  repository: <account-id>.dkr.ecr.<region>.amazonaws.com/messaging-service
-  tag: latest
