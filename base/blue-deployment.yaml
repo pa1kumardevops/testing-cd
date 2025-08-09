@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
       - name: myapp
-        image: ngin:1.19.0
+        image: nginx:1.19.0
         ports:
         - containerPort: 80
         resources:
