@@ -1,0 +1,94 @@
+name: Blue-Green Deployment
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+    - 'Blue-green-K8s/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      
+    - name: Configure Kubernetes credentials
+      uses: azure/k8s-set-context@v3
+      with:
+        kubeconfig: ${{ secrets.KUBE_CONFIG }}
+        
+    - name: Install Argo CD CLI
+      run: |
+        curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+        sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+        rm argocd-linux-amd64
+        
+    - name: Log in to Argo CD
+      run: |
+        # Get the Argo CD server address
+        ARGOCD_SERVER=$(kubectl get svc argocd-server -n argocd -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+        if [ -z "$ARGOCD_SERVER" ]; then
+          ARGOCD_SERVER=$(kubectl get svc argocd-server -n argocd -o jsonpath='{.spec.clusterIP}')
+        fi
+        
+        # Login to Argo CD - use --insecure if you don't have proper TLS setup
+        argocd login --insecure $ARGOCD_SERVER --username admin --password ${{ secrets.ARGOCD_PASSWORD }}
+        
+    - name: Determine active environment
+      id: active-env
+      run: |
+        ACTIVE_ENV=$(argocd app get blue-green-demo -o json | jq -r '.spec.source.path')
+        echo "Current path: $ACTIVE_ENV"
+        
+        if [[ "$ACTIVE_ENV" == *"blue-active"* ]]; then
+          echo "next_env=green-active" >> $GITHUB_OUTPUT
+          echo "current_env=blue-active" >> $GITHUB_OUTPUT
+          echo "Will switch to GREEN environment"
+        else
+          echo "next_env=blue-active" >> $GITHUB_OUTPUT
+          echo "current_env=green-active" >> $GITHUB_OUTPUT
+          echo "Will switch to BLUE environment"
+        fi
+        
+    - name: Update application to new environment
+      run: |
+        argocd app set blue-green-demo --path Kubernetes-Blue-Greeen-Deployment/overlays/${{ steps.active-env.outputs.next_env }}
+        echo "Updated path to: Kubernetes-Blue-Greeen-Deployment/overlays/${{ steps.active-env.outputs.next_env }}"
+        
+    - name: Wait for sync and health
+      run: |
+        argocd app wait blue-green-demo --health --timeout 300
+        
+    - name: Test the new environment
+      run: |
+        # Create a test script
+        cat > test-deployment.sh << 'EOF'
+        #!/bin/bash
+        # Test production service
+        echo "Testing Production Service..."
+        PROD_RESPONSE=$(kubectl run -i --rm --restart=Never curl-test --image=curlimages/curl -n blue-green-demo -- curl -s app-production)
+        echo "Production response contains: $(echo $PROD_RESPONSE | head -c 100)..."
+        
+        # Determine which version is active in production
+        if [[ "$PROD_RESPONSE" == *"BLUE"* ]]; then
+          echo "Production is serving BLUE version"
+          exit $([ "${{ steps.active-env.outputs.next_env }}" == "blue-active" ] && echo 0 || echo 1)
+        elif [[ "$PROD_RESPONSE" == *"GREEN"* ]]; then
+          echo "Production is serving GREEN version"
+          exit $([ "${{ steps.active-env.outputs.next_env }}" == "green-active" ] && echo 0 || echo 1)
+        else
+          echo "Could not determine active version"
+          exit 1
+        fi
+        EOF
+        
+        chmod +x test-deployment.sh
+        ./test-deployment.sh || {
+          echo "Test failed, rolling back..."
+          argocd app set blue-green-demo --path Kubernetes-Blue-Greeen-Deployment/overlays/${{ steps.active-env.outputs.current_env }}
+          exit 1
+        }

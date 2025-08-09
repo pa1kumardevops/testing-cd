@@ -1,0 +1,221 @@
+name: Blue-Green Deployment
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+    - '.github/workflows/blue-green-deploy.yml'
+  # Manual trigger option
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: blue-green
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+      
+    - name: Configure Kubernetes credentials
+      uses: azure/k8s-set-context@v3
+      with:
+        kubeconfig: ${{ secrets.KUBE_CONFIG }}
+        
+    - name: Verify connection to cluster
+      run: |
+        kubectl get nodes
+        kubectl get ns
+        
+    - name: Check if Argo CD application exists
+      id: check-app
+      run: |
+        if kubectl get application blue-green-demo -n argocd &>/dev/null; then
+          echo "application_exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "application_exists=false" >> $GITHUB_OUTPUT
+        fi
+      
+    - name: Create Argo CD application if not exists
+      if: steps.check-app.outputs.application_exists == 'false'
+      run: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: blue-green-demo
+          namespace: argocd
+        spec:
+          project: default
+          source:
+            repoURL: https://github.com/Sunitha82/Blue-green-K8s.git
+            targetRevision: HEAD
+            path: overlays/blue-active
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: blue-green-demo
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+            - CreateNamespace=true
+        EOF
+        
+        # Wait for the application to be created
+        kubectl wait --for=condition=created application/blue-green-demo -n argocd --timeout=30s
+        
+    - name: Determine active environment
+      id: active-env
+      run: |
+        # Get current path directly from the Application resource
+        ACTIVE_ENV=$(kubectl get application blue-green-demo -n argocd -o jsonpath='{.spec.source.path}')
+        echo "Current path: $ACTIVE_ENV"
+        
+        if [[ "$ACTIVE_ENV" == *"blue-active"* ]]; then
+          echo "next_env=green-active" >> $GITHUB_OUTPUT
+          echo "current_env=blue-active" >> $GITHUB_OUTPUT
+          echo "Will switch to GREEN environment"
+        else
+          echo "next_env=blue-active" >> $GITHUB_OUTPUT
+          echo "current_env=green-active" >> $GITHUB_OUTPUT
+          echo "Will switch to BLUE environment"
+        fi
+        
+    - name: Update application to new environment
+      run: |
+        # Use kubectl to patch the Application resource
+        kubectl patch application blue-green-demo -n argocd --type=merge -p "{\"spec\":{\"source\":{\"path\":\"overlays/${{ steps.active-env.outputs.next_env }}\"}}}"
+        echo "Updated path to: overlays/${{ steps.active-env.outputs.next_env }}"
+        
+    - name: Wait for sync to start
+      run: |
+        # Give ArgoCD a moment to detect the change and start syncing
+        sleep 10
+        
+    - name: Force refresh if needed
+      run: |
+        # Force a refresh if sync hasn't started
+        kubectl patch application blue-green-demo -n argocd --type=merge -p '{"operation":{"sync":{"revision":"HEAD"}}}'
+        
+    - name: Wait for sync and health
+      run: |
+        # Wait for sync to complete (up to 5 minutes)
+        echo "Waiting for sync to complete..."
+        
+        # Check sync status in a loop (ArgoCD might not have the condition format kubectl wait expects)
+        timeout=300
+        interval=10
+        elapsed=0
+        
+        while [ $elapsed -lt $timeout ]; do
+          SYNC_STATUS=$(kubectl get application blue-green-demo -n argocd -o jsonpath='{.status.sync.status}')
+          HEALTH_STATUS=$(kubectl get application blue-green-demo -n argocd -o jsonpath='{.status.health.status}')
+          
+          echo "Current status: Sync=$SYNC_STATUS, Health=$HEALTH_STATUS"
+          
+          if [[ "$SYNC_STATUS" == "Synced" && "$HEALTH_STATUS" == "Healthy" ]]; then
+            echo "Application is synced and healthy!"
+            break
+          fi
+          
+          sleep $interval
+          elapsed=$((elapsed + interval))
+          echo "Waited ${elapsed}s of ${timeout}s..."
+        done
+        
+        if [ $elapsed -ge $timeout ]; then
+          echo "Timed out waiting for application to sync and become healthy"
+          exit 1
+        fi
+        
+    - name: Test the new environment
+      id: test-env
+      run: |
+        # Give the services time to fully update
+        sleep 10
+        
+        # Create a test script
+        cat > test-deployment.sh << 'EOF'
+        #!/bin/bash
+        # Test direct services for availability
+        echo "Testing the services..."
+        
+        # Test that pods are running
+        PODS_RUNNING=$(kubectl get pods -n blue-green-demo -o jsonpath='{.items[*].status.phase}' | grep -c "Running")
+        if [ "$PODS_RUNNING" -lt 1 ]; then
+          echo "No running pods found in blue-green-demo namespace"
+          exit 1
+        fi
+        
+        # Test production service
+        echo "Testing Production Service..."
+        PROD_RESPONSE=$(kubectl run -i --rm --restart=Never curl-test --image=curlimages/curl -n blue-green-demo -- curl -s --max-time 10 app-production || echo "Failed to connect")
+        
+        if [[ "$PROD_RESPONSE" == *"Failed to connect"* ]]; then
+          echo "Could not connect to production service"
+          exit 1
+        fi
+        
+        echo "Production service responded successfully"
+        echo "Response snippet: $(echo $PROD_RESPONSE | head -c 100)..."
+        
+        # Determine which version is active in production based on response
+        if [[ "$PROD_RESPONSE" == *"BLUE"* ]]; then
+          echo "Production is serving BLUE version"
+          if [[ "$NEXT_ENV" == "blue-active" ]]; then
+            echo "Correct environment is active"
+            exit 0
+          else
+            echo "Wrong environment is active, expected GREEN"
+            exit 1
+          fi
+        elif [[ "$PROD_RESPONSE" == *"GREEN"* ]]; then
+          echo "Production is serving GREEN version"
+          if [[ "$NEXT_ENV" == "green-active" ]]; then
+            echo "Correct environment is active"
+            exit 0
+          else
+            echo "Wrong environment is active, expected BLUE"
+            exit 1
+          fi
+        else
+          echo "Could not determine active version from response"
+          echo "Response doesn't contain BLUE or GREEN indicator"
+          # Continue anyway since the service is responding
+          exit 0
+        fi
+        EOF
+        
+        chmod +x test-deployment.sh
+        
+        # Set environment variable for the test script
+        export NEXT_ENV=${{ steps.active-env.outputs.next_env }}
+        
+        # Run the test
+        if ./test-deployment.sh; then
+          echo "test_succeeded=true" >> $GITHUB_OUTPUT
+        else
+          echo "test_succeeded=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Rollback if test failed
+      if: steps.test-env.outputs.test_succeeded == 'false'
+      run: |
+        echo "Test failed, rolling back to previous environment..."
+        kubectl patch application blue-green-demo -n argocd --type=merge -p "{\"spec\":{\"source\":{\"path\":\"overlays/${{ steps.active-env.outputs.current_env }}\"}}}"
+        
+        # Wait for rollback to complete (simplified waiting)
+        sleep 30
+        echo "Rollback initiated. Check the ArgoCD UI for status."
+        
+        # Exit with error to indicate the deployment failed
+        exit 1
+        
+    - name: Deployment successful
+      if: steps.test-env.outputs.test_succeeded == 'true'
+      run: |
+        echo "Blue-Green deployment successful!"
+        echo "Active environment is now: ${{ steps.active-env.outputs.next_env }}"
