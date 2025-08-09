@@ -1,0 +1,6 @@
+package com.example.core;
+public class CoreApplication {
+    public static void main(String[] args) {
+        System.out.println("Core Service running...");
+    }
+}
