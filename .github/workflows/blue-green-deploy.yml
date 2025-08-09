@@ -15,6 +15,11 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
+    - name: Configure AWS credentials via OIDC
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::953448094970:role/test-oidc-eks
+        aws-region: us-east-1
       
     - name: Set up kubectl
       uses: azure/setup-kubectl@v3
